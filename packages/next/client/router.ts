@@ -91,6 +91,9 @@ routerEvents.forEach(event => {
       const eventField = `on${event.charAt(0).toUpperCase()}${event.substring(
         1
       )}`
+
+      getTimings(event, ...args) // measure performance timings during route change
+
       const _singletonRouter = singletonRouter as any
       if (_singletonRouter[eventField]) {
         try {
@@ -105,6 +108,54 @@ routerEvents.forEach(event => {
     })
   })
 })
+
+function getTimings(event: string, routeName: string) {
+  let longTaskCheck
+
+  if (event === 'routeChangeStart') {
+    performance.mark('routeChangeStart')
+  } else if (event === 'routeChangeComplete') {
+    const observer = new PerformanceObserver(list => {
+      const perfEntries = list.getEntries()
+      for (let i = 0; i < perfEntries.length; i++) {
+        clearTimeout(longTaskCheck) //if long task is observed, clear timeout
+        longTaskCheck = setTimeout(
+          () => mainThreadIdle(observer, perfEntries, routeName),
+          800 // if no long tasks are observed in 800ms, calculate time it took for thread to settle
+        )
+      }
+    })
+
+    observer.observe({ entryTypes: ['longtask'] })
+  }
+}
+
+function mainThreadIdle(
+  observer: PerformanceObserver,
+  perfEntries: PerformanceEntry[],
+  routeName: string
+) {
+  const routeStartTime = performance.getEntriesByName(
+    'routeChangeStart',
+    'mark'
+  )[0].startTime
+  const timeToIdle = perfEntries.reduce(
+    (max, task) =>
+      task.startTime + task.duration > max
+        ? task.startTime + task.duration
+        : max,
+    perfEntries[0].startTime + perfEntries[0].duration
+  )
+  const routeTTI = Math.round(timeToIdle - routeStartTime)
+
+  console.log(
+    `Navigating to ${routeName} took ${routeTTI}ms to become interactive`
+  )
+
+  performance.clearMarks()
+  performance.clearMeasures()
+  observer.disconnect()
+}
 
 function getRouter() {
   if (!singletonRouter.router) {
