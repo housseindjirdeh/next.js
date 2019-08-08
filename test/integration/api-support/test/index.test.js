@@ -10,6 +10,7 @@ import {
   renderViaHTTP,
   nextBuild,
   nextStart,
+  runNextCommand,
   File
 } from 'next-test-utils'
 import json from '../big.json'
@@ -43,6 +44,27 @@ function runTests (serverless = false) {
     const res = await fetchViaHTTP(port, '/api-conflict')
     expect(res.status).not.toEqual(404)
     killApp(app)
+  })
+
+  it('should work with index api', async () => {
+    if (serverless) {
+      const port = await findPort()
+      const resolver = require(join(appDir, '.next/serverless/pages/api.js'))
+        .default
+
+      const server = createServer(resolver).listen(port)
+      const res = await fetchViaHTTP(port, '/api')
+      const text = await res.text()
+      server.close()
+
+      expect(text).toEqual('Index should work')
+    } else {
+      const text = await fetchViaHTTP(appPort, '/api', null, {}).then(
+        res => res.ok && res.text()
+      )
+
+      expect(text).toEqual('Index should work')
+    }
   })
 
   it('should return custom error', async () => {
@@ -95,6 +117,18 @@ function runTests (serverless = false) {
 
     expect(data.status).toEqual(413)
     expect(data.statusText).toEqual('Body exceeded 1mb limit')
+  })
+
+  it('should parse bigger body then 1mb', async () => {
+    const data = await fetchViaHTTP(appPort, '/api/big-parse', null, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8'
+      },
+      body: JSON.stringify(json)
+    })
+
+    expect(data.status).toEqual(200)
   })
 
   it('should parse urlencoded body', async () => {
@@ -242,8 +276,26 @@ function runTests (serverless = false) {
       expect(
         existsSync(join(appDir, '.next/server/pages-manifest.json'), 'utf8')
       ).toBeTruthy()
+
+      const buildManifest = JSON.parse(
+        readFileSync(join(appDir, '.next/build-manifest.json'), 'utf8')
+      )
+      expect(
+        Object.keys(buildManifest.pages).includes('/api-conflict')
+      ).toBeTruthy()
     }
   })
+
+  if (!serverless) {
+    it('should warn about API export', async () => {
+      const { stdout } = await runNextCommand(['export', appDir], {
+        stdout: true,
+        stderr: true
+      })
+
+      expect(stdout).toContain('API pages are not supported in export')
+    })
+  }
 
   it('should return data on dynamic optional nested route', async () => {
     const data = await fetchViaHTTP(

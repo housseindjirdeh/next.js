@@ -1,10 +1,10 @@
 import ForkTsCheckerWebpackPlugin from 'fork-ts-checker-webpack-plugin'
-import fs from 'fs'
 import {
   CLIENT_STATIC_FILES_RUNTIME_MAIN,
   CLIENT_STATIC_FILES_RUNTIME_WEBPACK,
   REACT_LOADABLE_MANIFEST,
   SERVER_DIRECTORY,
+  SERVERLESS_DIRECTORY,
 } from 'next-server/constants'
 import resolve from 'next/dist/compiled/resolve/index.js'
 import path from 'path'
@@ -25,6 +25,7 @@ import ChunkNamesPlugin from './webpack/plugins/chunk-names-plugin'
 import { importAutoDllPlugin } from './webpack/plugins/dll-import'
 import { HashedChunkIdsPlugin } from './webpack/plugins/hashed-chunk-ids-plugin'
 import { DropClientPage } from './webpack/plugins/next-drop-client-page-plugin'
+import NextEsmPlugin from './webpack/plugins/next-esm-plugin'
 import NextJsSsrImportPlugin from './webpack/plugins/nextjs-ssr-import'
 import NextJsSSRModuleCachePlugin from './webpack/plugins/nextjs-ssr-module-cache'
 import PagesManifestPlugin from './webpack/plugins/pages-manifest-plugin'
@@ -78,7 +79,12 @@ export default async function getBaseWebpackConfig(
     .split(process.platform === 'win32' ? ';' : ':')
     .filter(p => !!p)
 
-  const outputDir = target === 'serverless' ? 'serverless' : SERVER_DIRECTORY
+  const isServerless = target === 'serverless'
+  const isServerlessTrace = target === 'experimental-serverless-trace'
+  // Intentionally not using isTargetLikeServerless helper
+  const isLikeServerless = isServerless || isServerlessTrace
+
+  const outputDir = isLikeServerless ? SERVERLESS_DIRECTORY : SERVER_DIRECTORY
   const outputPath = path.join(distDir, isServer ? outputDir : '')
   const totalPages = Object.keys(entrypoints).length
   const clientEntries = !isServer
@@ -175,6 +181,61 @@ export default async function getBaseWebpackConfig(
 
   const devtool = dev ? 'cheap-module-source-map' : false
 
+  // Contains various versions of the Webpack SplitChunksPlugin used in different build types
+  const splitChunksConfigs: {
+    [propName: string]: webpack.Options.SplitChunksOptions
+  } = {
+    dev: {
+      cacheGroups: {
+        default: false,
+        vendors: false,
+      },
+    },
+    selective: {
+      cacheGroups: {
+        default: false,
+        vendors: false,
+        react: {
+          name: 'commons',
+          chunks: 'all',
+          test: /[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/,
+        },
+      },
+    },
+    prod: {
+      chunks: 'all',
+      cacheGroups: {
+        default: false,
+        vendors: false,
+        commons: {
+          name: 'commons',
+          chunks: 'all',
+          minChunks: totalPages > 2 ? totalPages * 0.5 : 2,
+        },
+        react: {
+          name: 'commons',
+          chunks: 'all',
+          test: /[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/,
+        },
+      },
+    },
+  }
+
+  // Select appropriate SplitChunksPlugin config for this build
+  let splitChunksConfig: webpack.Options.SplitChunksOptions
+  if (dev) {
+    splitChunksConfig = splitChunksConfigs.dev
+  } else if (selectivePageBuilding) {
+    splitChunksConfig = splitChunksConfigs.selective
+  } else {
+    splitChunksConfig = splitChunksConfigs.prod
+  }
+
+  const crossOrigin =
+    !config.crossOrigin && config.experimental.modern
+      ? 'anonymous'
+      : config.crossOrigin
+
   let webpackConfig: webpack.Configuration = {
     devtool,
     mode: webpackMode,
@@ -182,7 +243,7 @@ export default async function getBaseWebpackConfig(
     target: isServer ? 'node' : 'web',
     externals: !isServer
       ? undefined
-      : target !== 'serverless'
+      : !isServerless
       ? [
           (context, request, callback) => {
             const notExternalModules = [
@@ -237,9 +298,9 @@ export default async function getBaseWebpackConfig(
           },
         ]
       : [
-          // When the serverless target is used all node_modules will be compiled into the output bundles
-          // So that the serverless bundles have 0 runtime dependencies
-          'amp-toolbox-optimizer', // except this one
+          // When the 'serverless' target is used all node_modules will be compiled into the output bundles
+          // So that the 'serverless' bundles have 0 runtime dependencies
+          '@ampproject/toolbox-optimizer', // except this one
           (context, request, callback) => {
             if (
               request === 'react-ssr-prepass' &&
@@ -272,42 +333,7 @@ export default async function getBaseWebpackConfig(
               : {
                   name: CLIENT_STATIC_FILES_RUNTIME_WEBPACK,
                 },
-            splitChunks: dev
-              ? {
-                  cacheGroups: {
-                    default: false,
-                    vendors: false,
-                  },
-                }
-              : selectivePageBuilding
-              ? {
-                  cacheGroups: {
-                    default: false,
-                    vendors: false,
-                    react: {
-                      name: 'commons',
-                      chunks: 'all',
-                      test: /[\\/]node_modules[\\/](react|react-dom)[\\/]/,
-                    },
-                  },
-                }
-              : {
-                  chunks: 'all',
-                  cacheGroups: {
-                    default: false,
-                    vendors: false,
-                    commons: {
-                      name: 'commons',
-                      chunks: 'all',
-                      minChunks: totalPages > 2 ? totalPages * 0.5 : 2,
-                    },
-                    react: {
-                      name: 'commons',
-                      chunks: 'all',
-                      test: /[\\/]node_modules[\\/](react|react-dom)[\\/]/,
-                    },
-                  },
-                },
+            splitChunks: splitChunksConfig,
             minimize: !dev,
             minimizer: !dev
               ? [
@@ -365,7 +391,7 @@ export default async function getBaseWebpackConfig(
         ? `${dev ? '[name]' : '[name].[contenthash]'}.js`
         : `static/chunks/${dev ? '[name]' : '[name].[contenthash]'}.js`,
       strictModuleExceptionHandling: true,
-      crossOriginLoading: config.crossOrigin,
+      crossOriginLoading: crossOrigin,
       futureEmitAssets: !dev,
       webassemblyModuleFilename: 'static/wasm/[modulehash].wasm',
     },
@@ -432,7 +458,7 @@ export default async function getBaseWebpackConfig(
       new ChunkNamesPlugin(),
       new webpack.DefinePlugin({
         ...Object.keys(config.env).reduce((acc, key) => {
-          if (/^(?:NODE_.+)|(?:__.+)$/i.test(key)) {
+          if (/^(?:NODE_.+)|^(?:__.+)$/i.test(key)) {
             throw new Error(
               `The key "${key}" under "env" in next.config.js is not allowed. https://err.sh/zeit/next.js/env-key-not-allowed`
             )
@@ -444,7 +470,7 @@ export default async function getBaseWebpackConfig(
           }
         }, {}),
         'process.env.NODE_ENV': JSON.stringify(webpackMode),
-        'process.crossOrigin': JSON.stringify(config.crossOrigin),
+        'process.crossOrigin': JSON.stringify(crossOrigin),
         'process.browser': JSON.stringify(!isServer),
         // This is used in client/dev-error-overlay/hot-dev-client.js to replace the dist directory
         ...(dev && !isServer
@@ -455,6 +481,7 @@ export default async function getBaseWebpackConfig(
         'process.env.__NEXT_EXPORT_TRAILING_SLASH': JSON.stringify(
           config.exportTrailingSlash
         ),
+        'process.env.__NEXT_MODERN_BUILD': config.experimental.modern && !dev,
         ...(isServer
           ? {
               // Allow browser-only code to be eliminated
@@ -539,11 +566,14 @@ export default async function getBaseWebpackConfig(
             )
           },
         }),
-      target === 'serverless' &&
-        (isServer || selectivePageBuilding) &&
-        new ServerlessPlugin(buildId, { isServer }),
-      isServer && new PagesManifestPlugin(target === 'serverless'),
-      target !== 'serverless' &&
+      isLikeServerless &&
+        new ServerlessPlugin(buildId, {
+          isServer,
+          isFlyingShuttle: selectivePageBuilding,
+          isTrace: isServerlessTrace,
+        }),
+      isServer && new PagesManifestPlugin(isLikeServerless),
+      target === 'server' &&
         isServer &&
         new NextJsSSRModuleCachePlugin({ outputPath }),
       isServer && new NextJsSsrImportPlugin(),
@@ -567,6 +597,23 @@ export default async function getBaseWebpackConfig(
           compilerOptions: { isolatedModules: true, noEmit: true },
           silent: true,
           formatter: 'codeframe',
+        }),
+      config.experimental.modern &&
+        !isServer &&
+        !dev &&
+        new NextEsmPlugin({
+          filename: (getFileName: Function | string) => (...args: any[]) => {
+            const name =
+              typeof getFileName === 'function'
+                ? getFileName(...args)
+                : getFileName
+
+            return name.includes('.js')
+              ? name.replace(/\.js$/, '.module.js')
+              : args[0].chunk.name.replace(/\.js$/, '.module.js')
+          },
+          chunkFilename: (inputChunkName: string) =>
+            inputChunkName.replace(/\.js$/, '.module.js'),
         }),
     ].filter((Boolean as any) as ExcludesFalse),
   }
